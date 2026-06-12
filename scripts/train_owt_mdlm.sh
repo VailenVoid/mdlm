@@ -1,27 +1,30 @@
 #!/bin/bash
-#SBATCH -J train_mdlm                 # Job name
-#SBATCH -o watch_folder/%x_%j.out     # output file (%j expands to jobID)
-#SBATCH -N 1                          # Total number of nodes requested
-#SBATCH --get-user-env                # retrieve the users login environment
-#SBATCH --mem=32000                   # server memory requested (per node)
-#SBATCH -t 960:00:00                  # Time limit (hh:mm:ss)
-#SBATCH --partition=gpu               # Request partition
-#SBATCH --constraint="[a5000|a6000|a100|3090]"
-#SBATCH --constraint="gpu-mid|gpu-high"
+#SBATCH -J train_mdlm
+#SBATCH -o /home/vasilije_ivanovic/mdlm/logs/train_%j.out
+#SBATCH -N 1
+#SBATCH --get-user-env
+#SBATCH --mem=64000
+#SBATCH -t 960:00:00
+#SBATCH --partition=non-reserved
 #SBATCH --ntasks-per-node=4
-#SBATCH --gres=gpu:4                  # Type/number of GPUs needed
-#SBATCH --open-mode=append            # Do not overwrite logs
-#SBATCH --requeue                     # Requeue upon pre-emption
+#SBATCH --gres=gpu:4
+#SBATCH --open-mode=append
+#SBATCH --requeue
 
-# To enable preemption re-loading, set `hydra.run.dir` or 
-# `checkpointing.save_dir` explicitly.
-srun python -u -m main \
+RUN_NAME=mdlm-owt
+RUN_DIR=/home/vasilije_ivanovic/mdlm/runs/${RUN_NAME}
+mkdir -p ${RUN_DIR}
+mkdir -p /home/vasilije_ivanovic/mdlm/logs
+
+srun micromamba run -p /home/vasilije_ivanovic/envs/mdlm python -u -m main \
   loader.batch_size=16 \
   loader.eval_batch_size=16 \
   model=small \
   data=openwebtext-split \
-  wandb.name=mdlm-owt \
+  wandb.name=${RUN_NAME} \
   parameterization=subs \
   model.length=1024 \
   eval.compute_generative_perplexity=True \
-  sampling.steps=1000
+  sampling.steps=1000 \
+  hydra.run.dir=${RUN_DIR} \
+  checkpointing.save_dir=${RUN_DIR}
