@@ -97,6 +97,9 @@ class Diffusion(L.LightningModule):
         self.config,
         vocab_size=self.vocab_size,
         pad_token_id=self.tokenizer.pad_token_id)
+    elif self.config.backbone == 'transformer':
+      self.backbone = models.transformer.Transformer(
+        self.config, vocab_size=self.vocab_size)
     elif self.config.backbone == 'ar':
       self.backbone = models.autoregressive.AR(
         self.config,
@@ -150,6 +153,32 @@ class Diffusion(L.LightningModule):
     self.neg_infinity = -1000000.0
     self.fast_forward_epochs = None
     self.fast_forward_batches = None
+    if self.parameterization == 'gidd':
+      # Hybrid masking + uniform noise schedule constants
+      # (arXiv 2503.04482); p_uniform=0 is floored at
+      # exp(-clip_noise) so that log B stays finite.
+      gidd_cfg = self.config.gidd
+      self.gidd_gamma = float(gidd_cfg.gamma)
+      clip_noise = float(gidd_cfg.clip_noise)
+      p_uniform = max(math.exp(-clip_noise),
+                      float(gidd_cfg.p_uniform))
+      log_B = (self.gidd_gamma * math.log(2)
+               + math.log(p_uniform)
+               - math.log(1 - p_uniform))
+      self.gidd_B = math.exp(max(log_B, -clip_noise))
+      self.gidd_loss_weighting = gidd_cfg.loss_weighting
+      self.gidd_min_loss_weight = float(
+        gidd_cfg.min_loss_weight)
+      self.gidd_max_loss_weight = float(
+        gidd_cfg.max_loss_weight)
+      mask_vec = torch.zeros(self.vocab_size)
+      mask_vec[self.mask_index] = 1
+      self.register_buffer(
+        'gidd_mask_vec', mask_vec, persistent=False)
+      self.register_buffer(
+        'gidd_unif_vec',
+        (1 - mask_vec) / (self.vocab_size - 1),
+        persistent=False)
     self._validate_configuration()
 
   def _validate_configuration(self):
@@ -164,6 +193,11 @@ class Diffusion(L.LightningModule):
       assert self.parameterization in {'d3pm', 'subs'}
     if self.subs_masking:
       assert self.parameterization == 'd3pm'
+    if self.parameterization == 'gidd':
+      assert self.T == 0, 'GIDD is continuous-time only.'
+      assert not self.change_of_variables
+      assert not self.importance_sampling
+      assert self.config.gidd.max_loss_weight > 0
 
   def on_load_checkpoint(self, checkpoint):
     if self.ema:
@@ -276,6 +310,15 @@ class Diffusion(L.LightningModule):
     logits[unmasked_indices, xt[unmasked_indices]] = 0
     return logits
 
+  def _gidd_parameterization(self, logits):
+    # x_theta is a distribution over non-mask tokens. Unlike
+    # SUBS there is no carry-over unmasking: the model may
+    # disagree with visible tokens (enables self-correction).
+    logits = logits.float()
+    logits[:, :, self.mask_index] += self.neg_infinity
+    return logits - torch.logsumexp(logits, dim=-1,
+                                    keepdim=True)
+
   def _d3pm_parameterization(self, logits):
     if self.subs_masking:
       logits[:, :, self.mask_index] += self.neg_infinity
@@ -318,6 +361,8 @@ class Diffusion(L.LightningModule):
     if self.parameterization == 'subs':
       return self._subs_parameterization(logits=logits,
                                          xt=x)
+    elif self.parameterization == 'gidd':
+      return self._gidd_parameterization(logits=logits)
     elif self.parameterization == 'sedd':
       return self._sedd_parameterization(logits=logits,
                                          xt=x,
@@ -357,12 +402,140 @@ class Diffusion(L.LightningModule):
 
     return self.T * L_vb
 
+  # GIDD: generalized interpolating discrete diffusion with
+  # hybrid masking + uniform noise (arXiv 2503.04482). Ported
+  # from the reference code: github.com/dvruette/gidd
+
+  def _gidd_alpha_betapi(self, t, eps=1e-4):
+    """Marginal q_t(.|x) = alpha_t * x + beta_pi_t.
+
+    Args:
+      t: float torch.Tensor with shape (batch_size,).
+
+    Returns:
+      alpha_t with shape (batch_size, 1) and beta_pi with
+      shape (batch_size, vocab_size).
+    """
+    t = t[:, None]
+    c_t = self.gidd_B * (t * (1 - t)).pow(
+      self.gidd_gamma / 2)
+    C_t = (1 + c_t).clip(min=eps)
+    alpha_t = (1 - t) / C_t
+    beta_pi = (t * self.gidd_mask_vec
+               + c_t * self.gidd_unif_vec) / C_t
+    return alpha_t, beta_pi
+
+  def _gidd_probs_at_t(self, prs, t):
+    alpha_t, beta_pi = self._gidd_alpha_betapi(t)
+    return prs * alpha_t.unsqueeze(-1) + beta_pi.unsqueeze(1)
+
+  def _gidd_q_xt(self, x, t):
+    """Samples z_t ~ q_t(.|x): keep / mask / uniform token."""
+    t = t[:, None]
+    c_t = self.gidd_B * (t * (1 - t)).pow(
+      self.gidd_gamma / 2)
+    C_t = (1 + c_t).clip(min=1e-4)
+    p_mask = t / C_t
+    p_unif = c_t / C_t
+    u = torch.rand(*x.shape, device=x.device)
+    # Uniform over the vocab minus the mask token; sampling
+    # x itself is allowed, matching pi_t's support.
+    rand_tokens = torch.randint(
+      0, self.vocab_size - 1, x.shape, device=x.device)
+    rand_tokens = rand_tokens + (
+      rand_tokens >= self.mask_index).to(rand_tokens.dtype)
+    zt = torch.where(u < p_unif, rand_tokens, x)
+    return torch.where(
+      (u >= p_unif) & (u < p_unif + p_mask),
+      self.mask_index, zt)
+
+  def _gidd_weights(self, t, zt, x0):
+    """Per-token ELBO weights and GIDD+ training weights."""
+    t = t[:, None].to(torch.float64)
+    t1m = 1 - t
+    c_t = self.gidd_B * (t * t1m).pow(self.gidd_gamma / 2)
+    c_t_prime = ((self.gidd_gamma / 2)
+                 * (1 - 2 * t) / (t * t1m) * c_t)
+
+    is_mask = (zt == self.mask_index).to(t.dtype)
+    is_x = (zt == x0).to(t.dtype)
+    n = self.vocab_size - 1
+    weight_on_x = ((c_t + t1m * c_t_prime) / n
+                   / (t1m * (t1m + c_t / n)))
+    weight_on_u = (c_t + t1m * c_t_prime) / (t1m * c_t)
+    weight_on_m = 1 / (t1m * t)
+    elbo_weights = (is_x * weight_on_x
+                    + is_mask * weight_on_m
+                    + (1 - is_x - is_mask) * weight_on_u)
+
+    loss_weights = elbo_weights.clone()
+    if self.gidd_loss_weighting == 'clip':
+      loss_weights.clip_(self.gidd_min_loss_weight,
+                         self.gidd_max_loss_weight)
+    elif self.gidd_loss_weighting == 'dynamic':
+      # GIDD+ weights; per the reference code, sigmoid(-t)
+      # stands in for the log-SNR ("close enough if C_t is
+      # close to 1").
+      log_snr = torch.sigmoid(-t)
+      x_scale = (self.gidd_B / self.vocab_size
+                 * torch.exp(self.gidd_gamma / 2 * log_snr))
+      loss_weights = ((1 - is_x)
+                      * ((1 - is_mask) + 2 * is_mask)
+                      + is_x * x_scale)
+      loss_weights.clip_(self.gidd_min_loss_weight,
+                         self.gidd_max_loss_weight)
+    return (elbo_weights.to(torch.float32),
+            loss_weights.to(torch.float32))
+
+  def _gidd_sample_t(self, n, device):
+    _eps_t = torch.rand(n, device=device)
+    if self.antithetic_sampling:
+      offset = torch.arange(n, device=device) / n
+      _eps_t = (_eps_t / n + offset) % 1
+    # The ELBO weights diverge at both endpoints, so unlike
+    # `_sample_t` keep t away from 1 as well.
+    return ((1 - 2 * self.sampling_eps) * _eps_t
+            + self.sampling_eps)
+
+  def _gidd_forward_pass(self, x0):
+    """Returns per-token (training loss, ELBO) for GIDD."""
+    t = self._gidd_sample_t(x0.shape[0], x0.device)
+    zt = self._gidd_q_xt(x0, t)
+    log_x_theta = self.forward(zt, t)
+    utils.print_nans(log_x_theta, 'model_output')
+
+    x_hat = log_x_theta.exp()
+    x_onehot = F.one_hot(
+      x0, self.vocab_size).to(x_hat.dtype)
+    log_q_t = self._gidd_probs_at_t(x_onehot, t).log().clip(
+      min=self.neg_infinity)
+    log_p_t = self._gidd_probs_at_t(x_hat, t).log().clip(
+      min=self.neg_infinity)
+
+    kl_loss = F.kl_div(log_p_t, log_q_t, reduction='none',
+                       log_target=True).sum(-1)
+    log_ratio = (
+      log_q_t.gather(-1, zt[:, :, None])
+      - log_p_t.gather(-1, zt[:, :, None])).squeeze(-1)
+    is_loss = log_ratio.exp() - log_ratio - 1
+
+    elbo_weights, loss_weights = self._gidd_weights(
+      t, zt, x0)
+    diffusion_loss = kl_loss + is_loss
+    return (loss_weights * diffusion_loss,
+            elbo_weights * diffusion_loss)
+
   def _compute_loss(self, batch, prefix):
     if 'attention_mask' in batch:
       attention_mask = batch['attention_mask']
     else:
-      attention_mask = None
-    losses = self._loss(batch['input_ids'], attention_mask)
+      # Packed corpora (e.g. the pretrain shards) hold only real tokens with
+      # no padding, so every position is attended. Instruction batches score
+      # their EOS padding on purpose (the model must learn to stop), so all
+      # ones is correct there too.
+      attention_mask = torch.ones_like(batch['input_ids'])
+    losses = self._loss(batch['input_ids'], attention_mask,
+                        cond_mask=batch.get('cond_mask', None))
     loss = losses.loss
 
     if prefix == 'train':
@@ -636,6 +809,60 @@ class Diffusion(L.LightningModule):
     copy_flag = (x != self.mask_index).to(x.dtype)
     return copy_flag * x + (1 - copy_flag) * _x
 
+  def _gidd_update(self, zt, t, s):
+    """Ancestral sampling step z_t -> z_s for GIDD (s < t).
+
+    Samples from q(z_s | z_t, x_theta) which, unlike the
+    SUBS updates above, may also revise visible tokens.
+    """
+    log_x_theta = self.forward(zt, t)
+    x_hat = log_x_theta.exp()
+    q_s = self._gidd_probs_at_t(x_hat, s)
+    q_t = self._gidd_probs_at_t(x_hat, t)
+    q_zt = q_t.gather(-1, zt[:, :, None])
+
+    alpha_t, beta_pi_t = self._gidd_alpha_betapi(t)
+    alpha_s, beta_pi_s = self._gidd_alpha_betapi(s)
+    alpha_ts = alpha_t / alpha_s
+    beta_pi_ts = beta_pi_t - alpha_ts * beta_pi_s
+
+    # q(z_t | z_s = v) evaluated at the observed z_t, for
+    # every candidate v: alpha_ts * 1[v = z_t] + beta_pi_ts[z_t]
+    beta_at_zt = beta_pi_ts.gather(-1, zt)[:, :, None]
+    q_ts_at_zt = (
+      alpha_ts.unsqueeze(-1)
+      * F.one_hot(zt, self.vocab_size).to(x_hat.dtype)
+      + beta_at_zt)
+    q_zs = q_ts_at_zt * q_s / q_zt
+    return _sample_categorical(q_zs)
+
+  @torch.no_grad()
+  def _gidd_sample(self, num_steps=None, eps=None):
+    """Generates samples with GIDD ancestral sampling."""
+    batch_size_per_gpu = self.config.loader.eval_batch_size
+    if num_steps is None:
+      num_steps = self.config.sampling.steps
+    if eps is None:
+      eps = self.sampling_eps
+    zt = self._sample_prior(
+      batch_size_per_gpu,
+      self.config.model.length).to(self.device)
+    ts = torch.linspace(eps, 1 - eps, num_steps + 1,
+                        device=self.device)
+    ones = torch.ones(zt.shape[0], device=self.device)
+    for i in range(num_steps, 0, -1):
+      zt = self._gidd_update(
+        zt, ts[i] * ones, ts[i - 1] * ones)
+    if self.config.sampling.noise_removal:
+      # Only leftover masks are replaced: a full argmax (as in
+      # the SUBS branch of `_sample`) would deterministically
+      # rewrite committed tokens, since GIDD's x_theta is not
+      # forced to carry them over.
+      log_x_theta = self.forward(zt, ts[0] * ones)
+      zt = torch.where(zt == self.mask_index,
+                       log_x_theta.argmax(-1), zt)
+    return zt
+
   def _ar_sampler(self, bsz):
     # precompute token buffer
     num_pred_tokens = self.config.model.length - 1
@@ -660,6 +887,8 @@ class Diffusion(L.LightningModule):
     batch_size_per_gpu = self.config.loader.eval_batch_size
     if self.parameterization == 'ar':
       return self._ar_sampler(batch_size_per_gpu)
+    if self.parameterization == 'gidd':
+      return self._gidd_sample(num_steps=num_steps)
     # Lightning auto-casting is not working in this method for some reason
     if num_steps is None:
       num_steps = self.config.sampling.steps
@@ -844,7 +1073,7 @@ class Diffusion(L.LightningModule):
                           dim=-1,
                           index=x0[:, :, None]).squeeze(-1)
 
-  def _forward_pass_diffusion(self, x0):
+  def _forward_pass_diffusion(self, x0, cond_mask=None):
     t = self._sample_t(x0.shape[0], x0.device)
     if self.T > 0:
       t = (t * self.T).to(torch.int)
@@ -864,6 +1093,12 @@ class Diffusion(L.LightningModule):
       move_chance = 1 - torch.exp(-sigma[:, None])
 
     xt = self.q_xt(x0, move_chance)
+    if cond_mask is not None:
+      # Prompt-conditioned SFT: condition tokens stay clean at every t,
+      # so the reverse process learns p(response | prompt). Under SUBS
+      # carry-over their loss is exactly zero; _loss additionally drops
+      # them from the token mask.
+      xt = torch.where(cond_mask, x0, xt)
     model_output = self.forward(xt, unet_conditioning)
     utils.print_nans(model_output, 'model_output')
 
@@ -893,18 +1128,41 @@ class Diffusion(L.LightningModule):
     return - log_p_theta * (
       dsigma / torch.expm1(sigma))[:, None]
 
-  def _loss(self, x0, attention_mask):
+  def _loss(self, x0, attention_mask, cond_mask=None):
     (input_tokens, output_tokens,
      attention_mask) = self._maybe_sub_sample(
        x0, attention_mask)
+    if cond_mask is not None:
+      # Instruction tuning: condition/prompt tokens are never noised
+      # (see _forward_pass_diffusion) and never scored -- the objective
+      # covers response + EOS-padding positions only, mirroring the
+      # AR-M IT loss masking (sde_llm/src/ar_train_step.py).
+      assert self.parameterization in {'subs', 'd3pm', 'sedd'}, (
+        'cond_mask is only supported for masked-diffusion '
+        f'parameterizations, got {self.parameterization}.')
+      assert input_tokens.shape == cond_mask.shape, (
+        'cond_mask must not be used with corpora that require '
+        'sub-sampling (e.g. text8-crop).')
+      attention_mask = attention_mask * (~cond_mask).to(
+        attention_mask.dtype)
 
     if self.parameterization == 'ar':
       logprobs = self.backbone(input_tokens, None)
       loss = - logprobs.gather(
         -1, output_tokens[:, :, None])[:, :, 0]
+    elif self.parameterization == 'gidd':
+      loss, elbo = self._gidd_forward_pass(input_tokens)
+      # Gradients use the (clipped / dynamic) loss weights;
+      # the nll/ppl metrics track the unweighted ELBO.
+      token_nll = ((loss * attention_mask).sum()
+                   / attention_mask.sum())
+      return Loss(loss=token_nll,
+                  nlls=elbo * attention_mask,
+                  token_mask=attention_mask)
     else:
-      loss = self._forward_pass_diffusion(input_tokens)
-    
+      loss = self._forward_pass_diffusion(input_tokens,
+                                          cond_mask=cond_mask)
+
     nlls = loss * attention_mask
     count = attention_mask.sum()
 

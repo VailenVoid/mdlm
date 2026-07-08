@@ -1,0 +1,20 @@
+# Pretrain corpus shared with the AR-M baseline (sde_llm).
+#
+# These are Arrow IPC shards produced by
+#   sde_llm/scripts/prepare_pretrain_data.py
+# (fineweb-edu, finepdfs-edu, finewiki, the-stack-dedup, open-web-math,
+#  pre_1929_books), tokenized with T5-small and packed into fixed-length
+# windows of model.length tokens. Each row is already a token-id window, so
+# dataloader.py loads it directly (no tokenize/group step).
+#
+# `train`/`valid` are the sentinel value `pretrain`; the actual shards come
+# from `pretrain_dir`. The last `n_valid_shards` shard(s) are held out for
+# validation.
+train: pretrain
+valid: pretrain
+tokenizer_name_or_path: t5-small
+cache_dir: /home/vasilije_ivanovic/data
+wrap: False
+streaming: False
+pretrain_dir: /home/vasilije_ivanovic/sde_llm/data/pretrain_data/pretrain_train
+n_valid_shards: 1

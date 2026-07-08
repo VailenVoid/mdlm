@@ -1,0 +1,12 @@
+# ~302M params total with the bert-base-uncased vocab (30522):
+# 19 blocks x 12.59M + 2 x 31.3M (untied in/out embeddings).
+name: transformer-300m
+type: ddit
+hidden_size: 1024
+cond_dim: 128
+length: 1024
+n_blocks: 24
+n_heads: 16
+scale_by_sigma: True
+dropout: 0.1
+tie_word_embeddings: False

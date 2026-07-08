@@ -68,7 +68,6 @@ def _print_config(
       rich.print(tree, file=fp)
 
 
-@L.pytorch.utilities.rank_zero_only
 def _print_batch(train_ds, valid_ds, tokenizer, k=64):
   for dl_type, dl in [
     ('train', train_ds), ('valid', valid_ds)]:
@@ -145,6 +144,23 @@ def _ppl_eval(config, logger, tokenizer):
   trainer.validate(model, valid_ds)
 
 
+def _init_weights_from_checkpoint(model, init_ckpt_path, logger):
+  """Warm-starts model weights (and EMA) from a pretrained checkpoint.
+
+  Mirrors the AR-M warm start (sde_llm load_checkpoint with
+  load_opt_state=False): raw weights and the pretrain EMA are copied;
+  optimizer, LR schedule and step counters start fresh. The source
+  checkpoint is only read, never modified.
+  """
+  logger.info(f'Warm-starting weights from {init_ckpt_path}')
+  checkpoint = torch.load(init_ckpt_path, map_location='cpu',
+                          weights_only=False)
+  model.load_state_dict(checkpoint['state_dict'])
+  if model.ema is not None and 'ema' in checkpoint:
+    model.ema.load_state_dict(checkpoint['ema'])
+  del checkpoint
+
+
 def _train(config, logger, tokenizer):
   logger.info('Starting Training.')
   wandb_logger = None
@@ -173,6 +189,13 @@ def _train(config, logger, tokenizer):
 
   model = diffusion.Diffusion(
     config, tokenizer=valid_ds.tokenizer)
+
+  init_ckpt_path = config.checkpointing.get('init_from_ckpt')
+  if init_ckpt_path and ckpt_path is None:
+    _init_weights_from_checkpoint(model, init_ckpt_path, logger)
+  elif init_ckpt_path:
+    logger.info(
+      f'Resuming from {ckpt_path}; ignoring init_from_ckpt.')
 
   trainer = hydra.utils.instantiate(
     config.trainer,

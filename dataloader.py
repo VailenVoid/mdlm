@@ -1,4 +1,6 @@
+import bisect
 import functools
+import glob
 import itertools
 import json
 import math
@@ -505,11 +507,15 @@ def get_tokenizer(config):
   #  [BOS] sent1 [EOS] sent2-fragment [EOS]
   #  [BOS] sent2-fragment [EOS] sent3 [EOS]
   if tokenizer.bos_token is None:
-    if tokenizer.cls_token is None:
+    if tokenizer.cls_token is not None:
+      tokenizer.bos_token = tokenizer.cls_token
+    elif tokenizer.eos_token is not None:
+      # e.g. T5, which has neither a bos_token nor a cls_token.
+      tokenizer.bos_token = tokenizer.eos_token
+    else:
       raise AttributeError(
-        'Tokenizer must have a bos_token or '
-        f'cls_token: {tokenizer}')
-    tokenizer.bos_token = tokenizer.cls_token
+        'Tokenizer must have a bos_token, cls_token, '
+        f'or eos_token: {tokenizer}')
   if tokenizer.eos_token is None:
     if tokenizer.sep_token is None:
       raise AttributeError(
@@ -521,6 +527,221 @@ def get_tokenizer(config):
 
   return tokenizer
     
+
+_SHARD_METADATA_FILE = '_shard_metadata.json'
+
+
+class PackedArrowShardDataset(torch.utils.data.Dataset):
+  """Map-style dataset over pre-tokenized, pre-packed Arrow IPC shard files.
+
+  These shards are produced by
+  ``sde_llm/scripts/prepare_pretrain_data.py`` -- the exact corpus the AR-M
+  baseline pretrains on. Every row already holds ``model.length`` token ids
+  (T5-small tokenized, packed with no padding) in the ``target_ids`` column,
+  so no tokenization / grouping happens here.
+
+  Shards are memory-mapped and opened lazily inside each DataLoader worker, so
+  token data is served from the OS page cache and never copied into the Python
+  heap. Because pyarrow memory-maps are not fork-safe to share, the per-shard
+  table cache is keyed by pid and rebuilt in each worker.
+  """
+
+  ID_COLUMN = 'target_ids'
+
+  def __init__(self, shard_paths):
+    import pyarrow as pa
+    import pyarrow.ipc as ipc
+    if not shard_paths:
+      raise ValueError(
+        'PackedArrowShardDataset received an empty list of shards.')
+    self.shard_paths = list(shard_paths)
+    # Row counts come from the IPC footers only; read_all() is mmap-backed and
+    # does not copy the token data.
+    self._shard_lens = []
+    for path in self.shard_paths:
+      with pa.memory_map(path, 'r') as mm:
+        self._shard_lens.append(ipc.open_file(mm).read_all().num_rows)
+    self._offsets = [0]
+    for n in self._shard_lens:
+      self._offsets.append(self._offsets[-1] + n)
+    self._length = self._offsets[-1]
+    self._tables = None   # {shard_idx: (mmap, table)} — populated per worker
+    self._pid = None
+
+  def __len__(self):
+    return self._length
+
+  def _get_table(self, shard_idx):
+    import pyarrow as pa
+    import pyarrow.ipc as ipc
+    pid = os.getpid()
+    if self._tables is None or self._pid != pid:
+      self._tables = {}
+      self._pid = pid
+    cached = self._tables.get(shard_idx)
+    if cached is None:
+      mm = pa.memory_map(self.shard_paths[shard_idx], 'r')
+      table = ipc.open_file(mm).read_all()
+      # Keep the mmap referenced so the table's buffers stay valid.
+      self._tables[shard_idx] = (mm, table)
+      return table
+    return cached[1]
+
+  def _locate(self, idx):
+    if idx < 0:
+      idx += self._length
+    shard_idx = bisect.bisect_right(self._offsets, idx) - 1
+    return shard_idx, idx - self._offsets[shard_idx]
+
+  def __getitem__(self, idx):
+    shard_idx, local_idx = self._locate(idx)
+    ids = self._get_table(shard_idx).column(self.ID_COLUMN)[local_idx].as_py()
+    return {'input_ids': torch.tensor(ids, dtype=torch.long)}
+
+
+def _to_instruction_example(condition_ids, target_ids,
+                            seq_length, pad_token_id):
+  """Builds a fixed-length instruction-tuning example.
+
+  Mirrors the AR-M IT collation (sde_llm data_utils.get_dataloader with
+  pad_token: eos): input = condition + target, right-padded to
+  ``seq_length`` with EOS so the model learns to terminate responses.
+  ``cond_mask`` marks the condition positions -- these are never noised
+  by the forward process and never scored; the response and the trailing
+  EOS padding are.
+
+  Examples are pre-filtered to condition + target <= seq_length by
+  prepare_instruction_data.py; truncation here is a defensive no-op.
+  """
+  seq = list(condition_ids) + list(target_ids)
+  seq = seq[:seq_length]
+  cond_len = min(len(condition_ids), seq_length)
+  input_ids = torch.full(
+    (seq_length,), pad_token_id, dtype=torch.long)
+  input_ids[:len(seq)] = torch.tensor(seq, dtype=torch.long)
+  cond_mask = torch.zeros(seq_length, dtype=torch.bool)
+  cond_mask[:cond_len] = True
+  return {'input_ids': input_ids, 'cond_mask': cond_mask}
+
+
+class InstructionShardDataset(PackedArrowShardDataset):
+  """Instruction-tuning pairs from Arrow IPC shards.
+
+  Shards are produced by ``sde_llm/scripts/prepare_instruction_data.py``
+  (smol-smoltalk / ultrachat_200k / tulu-3-sft, T5-small tokenized): each
+  row holds ``condition_ids`` (chat history up to and including the
+  trailing "[assistant]" tag) and ``target_ids`` (the final assistant
+  response). Inherits the lazy per-worker mmap machinery from
+  ``PackedArrowShardDataset``.
+  """
+
+  def __init__(self, shard_paths, seq_length, pad_token_id):
+    super().__init__(shard_paths)
+    self.seq_length = seq_length
+    self.pad_token_id = pad_token_id
+
+  def __getitem__(self, idx):
+    shard_idx, local_idx = self._locate(idx)
+    table = self._get_table(shard_idx)
+    condition_ids = table.column('condition_ids')[local_idx].as_py()
+    target_ids = table.column('target_ids')[local_idx].as_py()
+    return _to_instruction_example(
+      condition_ids, target_ids, self.seq_length, self.pad_token_id)
+
+
+class InstructionValidDataset(torch.utils.data.Dataset):
+  """Same example format as ``InstructionShardDataset``, over the valid
+  split written by prepare_instruction_data.py (HF save_to_disk layout).
+
+  The .arrow file is read directly with pyarrow rather than
+  ``datasets.load_from_disk`` -- the split was written by a newer
+  `datasets` version whose feature schema this env cannot parse. The
+  split is small (~1000 rows), so it is materialized eagerly, which also
+  keeps it fork-safe for DataLoader workers.
+  """
+
+  def __init__(self, dataset_path, seq_length, pad_token_id):
+    import pyarrow as pa
+    import pyarrow.ipc as ipc
+    arrow_paths = sorted(
+      glob.glob(os.path.join(dataset_path, '*.arrow')))
+    if not arrow_paths:
+      raise FileNotFoundError(
+        f'No .arrow files found in {dataset_path!r}.')
+    conditions, targets = [], []
+    for path in arrow_paths:
+      with pa.memory_map(path, 'r') as mm:
+        try:
+          table = ipc.open_stream(mm).read_all()
+        except pa.lib.ArrowInvalid:
+          table = ipc.open_file(mm).read_all()
+        conditions.extend(table.column('condition_ids').to_pylist())
+        targets.extend(table.column('target_ids').to_pylist())
+    self.examples = list(zip(conditions, targets))
+    self.seq_length = seq_length
+    self.pad_token_id = pad_token_id
+
+  def __len__(self):
+    return len(self.examples)
+
+  def __getitem__(self, idx):
+    condition_ids, target_ids = self.examples[idx]
+    return _to_instruction_example(
+      condition_ids, target_ids, self.seq_length, self.pad_token_id)
+
+
+def get_instruction_datasets(config, tokenizer):
+  """Builds (train, valid) instruction-tuning datasets shared with the
+  AR-M baseline's IT stage."""
+  train_dir = config.data.instruction_train_dir
+  meta_path = os.path.join(train_dir, _SHARD_METADATA_FILE)
+  if not os.path.isfile(meta_path):
+    raise FileNotFoundError(
+      f'No {_SHARD_METADATA_FILE} found in {train_dir!r}; expected a '
+      'directory of Arrow IPC shards from prepare_instruction_data.py.')
+  shard_paths = sorted(
+    glob.glob(os.path.join(train_dir, 'shard_*.arrow')))
+  if not shard_paths:
+    raise FileNotFoundError(f'No shard_*.arrow files in {train_dir!r}.')
+  # EOS padding, mirroring the AR-M IT recipe (pad_token: eos).
+  pad_token_id = tokenizer.eos_token_id
+  train_set = InstructionShardDataset(
+    shard_paths, config.model.length, pad_token_id)
+  valid_set = InstructionValidDataset(
+    config.data.instruction_valid_dir, config.model.length,
+    pad_token_id)
+  LOGGER.info(
+    f'Instruction corpus: {len(train_set)} train examples from '
+    f'{len(shard_paths)} shards, {len(valid_set)} valid examples.')
+  return train_set, valid_set
+
+
+def get_packed_pretrain_datasets(pretrain_dir, n_valid_shards=1):
+  """Build (train, valid) datasets from a directory of Arrow IPC shards.
+
+  The last ``n_valid_shards`` shard(s) are held out for validation (the AR-M
+  baseline uses no held-out split, so this is a small, negligible carve-out
+  purely to give MDLM's Lightning loop a validation signal).
+  """
+  meta_path = os.path.join(pretrain_dir, _SHARD_METADATA_FILE)
+  if not os.path.isfile(meta_path):
+    raise FileNotFoundError(
+      f'No {_SHARD_METADATA_FILE} found in {pretrain_dir!r}; expected a '
+      'directory of Arrow IPC shards from prepare_pretrain_data.py.')
+  shard_paths = sorted(
+    glob.glob(os.path.join(pretrain_dir, 'shard_*.arrow')))
+  if len(shard_paths) <= n_valid_shards:
+    raise ValueError(
+      f'Found {len(shard_paths)} shard(s) in {pretrain_dir!r}, need more '
+      f'than n_valid_shards={n_valid_shards}.')
+  train_paths = shard_paths[:-n_valid_shards]
+  valid_paths = shard_paths[-n_valid_shards:]
+  LOGGER.info(
+    f'Packed pretrain corpus: {len(train_paths)} train shards, '
+    f'{len(valid_paths)} valid shard(s) from {pretrain_dir}')
+  return (PackedArrowShardDataset(train_paths),
+          PackedArrowShardDataset(valid_paths))
+
 
 def get_dataloaders(config, tokenizer, skip_train=False,
                     skip_valid=False, valid_seed=None):
@@ -540,8 +761,28 @@ def get_dataloaders(config, tokenizer, skip_train=False,
     raise ValueError(
       f'Eval Batch Size for {config.eval.batch_size} '
       f'not divisible by {num_gpus}.')
+  # Pre-tokenized / pre-packed corpus (shared with the AR-M baseline): the
+  # rows are already token-id windows of length model.length, so we bypass the
+  # HuggingFace tokenize/group pipeline entirely.
+  packed_pretrain = config.data.train == 'pretrain'
+  if packed_pretrain:
+    packed_train_set, packed_valid_set = get_packed_pretrain_datasets(
+      config.data.pretrain_dir,
+      n_valid_shards=config.data.get('n_valid_shards', 1))
+  # Instruction-tuning pairs (shared with the AR-M baseline's IT stage):
+  # like the packed corpus, rows are pre-tokenized, so we bypass the
+  # HuggingFace tokenize/group pipeline.
+  instruction = config.data.train == 'instruction'
+  if instruction:
+    instruction_train_set, instruction_valid_set = (
+      get_instruction_datasets(config, tokenizer))
+
   if skip_train:
     train_set = None
+  elif packed_pretrain:
+    train_set = packed_train_set
+  elif instruction:
+    train_set = instruction_train_set
   else:
     train_set = get_dataset(
       config.data.train,
@@ -550,13 +791,17 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       wrap=config.data.wrap,
       cache_dir=config.data.cache_dir,
       block_size=config.model.length)
-  
+
   if config.data.valid in ['text8', 'lm1b', 'ag_news']:
     validation_split = 'test'
   else:
     validation_split = 'validation'
   if skip_valid:
     valid_set = None
+  elif packed_pretrain:
+    valid_set = packed_valid_set
+  elif instruction:
+    valid_set = instruction_valid_set
   else:
     valid_set = get_dataset(
       config.data.valid,
@@ -593,7 +838,8 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       num_workers=config.loader.num_workers,
       pin_memory=config.loader.pin_memory,
       shuffle=shuffle_valid,
-      generator=generator)
+      generator=generator,
+      persistent_workers=True)
     # Will be used in generative perplexity calculation
     valid_loader.tokenizer = tokenizer
 

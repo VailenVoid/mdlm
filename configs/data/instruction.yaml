@@ -1,0 +1,26 @@
+# Instruction-tuning corpus shared with the AR-M baseline (sde_llm Stage 2).
+#
+# Produced by sde_llm/scripts/prepare_instruction_data.py from
+# smol-smoltalk, ultrachat_200k and tulu-3-sft-mixture, T5-small tokenized
+# with the chat template
+#   [user] {user} [assistant] {assistant} ... [user] {user} [assistant]
+# Each row holds `condition_ids` (history up to and including the trailing
+# "[assistant]" tag) and `target_ids` (the final assistant response),
+# pre-filtered so condition + target <= 1024 tokens.
+#
+# The dataloader concatenates condition + target, right-pads to model.length
+# with EOS (mirroring the AR-M IT recipe, pad_token: eos) and emits a
+# `cond_mask` marking the condition positions, which are never noised and
+# never scored.
+#
+# `train`/`valid` are the sentinel value `instruction`; the actual data comes
+# from `instruction_train_dir` (Arrow IPC shards) and `instruction_valid_dir`
+# (HuggingFace save_to_disk format).
+train: instruction
+valid: instruction
+tokenizer_name_or_path: t5-small
+cache_dir: /home/vasilije_ivanovic/data
+wrap: False
+streaming: False
+instruction_train_dir: /home/vasilije_ivanovic/sde_llm/data/instruction_data/instruction_train
+instruction_valid_dir: /home/vasilije_ivanovic/sde_llm/data/instruction_data/instruction_valid

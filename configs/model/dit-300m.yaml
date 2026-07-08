@@ -1,0 +1,14 @@
+# Time-conditioned counterpart of transformer-300m: same
+# transformer+FFN blocks plus adaLN conditioning (~0.79M/block),
+# so 18 blocks x 13.38M + 2 x 31.3M untied embeddings ~= 304M
+# with the bert-base-uncased vocab (30522).
+name: dit-300m
+type: ddit
+hidden_size: 1024
+cond_dim: 128
+length: 1024
+n_blocks: 18
+n_heads: 16
+scale_by_sigma: True
+dropout: 0.1
+tie_word_embeddings: False
